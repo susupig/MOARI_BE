@@ -66,7 +66,7 @@ jobs:
             -p 127.0.0.1:8080:8080 \
             --env DB_HOST=moari-db --env DB_USER=moari_ci \
             --env DB_PASSWORD=ci-mysql-user --env DB_NAME=moari_db "$IMAGE"
-          curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 2 http://127.0.0.1:8080/
+          curl --fail --silent --show-error --max-time 5 --retry 12 --retry-all-errors --retry-delay 2 http://127.0.0.1:8080/
       - name: Print container logs on failure
         if: failure()
         run: docker logs moari-be || true
