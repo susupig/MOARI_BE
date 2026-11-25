@@ -1,0 +1,79 @@
+name: MOARI CI/CD
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI · Backend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check JavaScript syntax
+        run: git ls-files -z '*.js' | xargs -0 -r -n 1 node --check
+
+  delivery:
+    name: CD · Verify and publish Docker image
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Build Docker image
+        run: docker build --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" --tag "$IMAGE" .
+      - name: Start backend with a temporary MySQL database and verify the HTTP response
+        run: |
+          docker network create moari-ci
+          docker run --detach --network moari-ci --name moari-db \
+            --env MYSQL_ROOT_PASSWORD=ci-mysql-root \
+            --env MYSQL_DATABASE=moari_db \
+            --env MYSQL_USER=moari_ci \
+            --env MYSQL_PASSWORD=ci-mysql-user \
+            mysql:8.4
+          for attempt in {1..45}; do
+            if docker exec moari-db mysql --protocol=TCP -h 127.0.0.1 -u moari_ci -pci-mysql-user moari_db -e 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 45 ]; then
+              docker logs moari-db
+              exit 1
+            fi
+            sleep 2
+          done
+          docker run --detach --network moari-ci --name moari-be \
+            -p 127.0.0.1:8080:8080 \
+            --env DB_HOST=moari-db --env DB_USER=moari_ci \
+            --env DB_PASSWORD=ci-mysql-user --env DB_NAME=moari_db "$IMAGE"
+          curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 2 http://127.0.0.1:8080/
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs moari-be || true
+      - name: Publish verified image to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          printf 'Published `%s`\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
